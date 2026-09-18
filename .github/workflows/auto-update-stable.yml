@@ -1,0 +1,142 @@
+name: Auto update stable releases
+
+on:
+  schedule:
+    # 10:37 Asia/Shanghai; GitHub may delay scheduled runs.
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-update-stable
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'nox18/nodewarden' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      update: ${{ steps.prepare.outputs.update }}
+      base: ${{ steps.prepare.outputs.base }}
+      target: ${{ steps.prepare.outputs.target }}
+      tree: ${{ steps.prepare.outputs.tree }}
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare latest stable release without publishing
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/shuaiplus/nodewarden/releases/latest \
+            --jq 'select(.draft == false and .prerelease == false) | .tag_name')"
+          test -n "$tag"
+          git check-ref-format "refs/tags/$tag"
+          git fetch --no-tags https://github.com/shuaiplus/nodewarden.git "refs/tags/$tag"
+          target="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          base="$(git rev-parse HEAD)"
+
+          if git merge-base --is-ancestor "$target" HEAD; then
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "Already includes stable release $tag. No update or downgrade needed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-ff --no-commit "$target"; then
+            git merge --abort
+            echo "::error::Merge conflict. Main was not changed; resolve the conflict manually."
+            exit 1
+          fi
+
+          # The built-in token cannot publish changes to workflow files.
+          if ! git diff --cached --quiet -- .github/workflows/; then
+            echo "::error::This release changes GitHub Actions workflows. Sync it manually on GitHub, then retry. Main was not changed."
+            exit 1
+          fi
+          {
+            echo "update=true"
+            echo "base=$base"
+            echo "target=$target"
+            echo "tree=$(git write-tree)"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.prepare.outputs.update == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+
+      - name: Install and verify the candidate release
+        if: steps.prepare.outputs.update == 'true'
+        env:
+          EXPECTED_TREE: ${{ steps.prepare.outputs.tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm audit --audit-level=high
+          npm run lint --if-present
+          npm run typecheck --if-present
+          npm test --if-present
+          npm run test:config-compatibility --if-present
+          npm run test:web-crypto --if-present
+          npm run test:notifications-security --if-present
+          npm run test:webauthn-connectors --if-present
+          npm run build
+          git diff --exit-code
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+
+  publish:
+    needs: verify
+    if: needs.verify.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main without persisted credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Publish only the verified merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.verify.outputs.base }}
+          TARGET_SHA: ${{ needs.verify.outputs.target }}
+          EXPECTED_TREE: ${{ needs.verify.outputs.tree }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "$BASE_SHA" ]; then
+            echo "::error::Main changed during verification. Retry to verify the new base."
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/shuaiplus/nodewarden.git "$TARGET_SHA"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$TARGET_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-commit "$TARGET_SHA"
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git commit -m "chore: sync upstream stable release $RELEASE_TAG"
+          # A normal push rejects concurrent updates instead of overwriting them.
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            push origin HEAD:refs/heads/main
+          echo "Synced $RELEASE_TAG to main. Cloudflare Workers Builds can now deploy this commit." >> "$GITHUB_STEP_SUMMARY"
